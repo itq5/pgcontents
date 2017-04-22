@@ -6,6 +6,7 @@ python:
 env:
   - IPYTHON=3
   - IPYTHON=4
+  - IPYTHON=5
 
 addons:
   postgresql: "9.3"
