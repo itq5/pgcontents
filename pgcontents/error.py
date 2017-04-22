@@ -33,3 +33,11 @@ class DirectoryNotEmpty(Exception):
 
 class FileTooLarge(Exception):
     pass
+
+
+class RenameRoot(Exception):
+    pass
+
+
+class CorruptedFile(Exception):
+    pass

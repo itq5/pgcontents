@@ -23,28 +23,11 @@ from base64 import (
 from dateutil.parser import parse
 from six import iteritems
 
-try:
-    from traitlets.config import Config
-    from notebook.services.contents.filemanager import \
-        FileContentsManager
-    from notebook.services.contents.filecheckpoints import \
-        GenericFileCheckpoints
-    from notebook.services.contents.tests.test_contents_api import \
-        APITest
-    from notebook.utils import to_os_path
-except ImportError:
-    from IPython.config import Config
-    from IPython.html.services.contents.filemanager import \
-        FileContentsManager
-    from IPython.html.services.contents.filecheckpoints import \
-        GenericFileCheckpoints
-    from IPython.html.services.contents.tests.test_contents_api import \
-        APITest
-    from IPython.html.utils import to_os_path
 from IPython.utils.tempdir import TemporaryDirectory
 from requests import HTTPError
 
 from ..constants import UNLIMITED
+from ..crypto import FernetEncryption, NoEncryption
 from ..hybridmanager import HybridContentsManager
 from ..pgmanager import (
     PostgresContentsManager,
@@ -60,19 +43,25 @@ from ..query import (
     save_file,
 )
 from .utils import (
+    clear_test_db,
+    make_fernet,
     _norm_unicode,
-    drop_testing_db_tables,
-    migrate_testing_db,
+    remigrate_test_schema,
     TEST_DB_URL,
 )
+from ..utils.ipycompat import (
+    APITest, Config, FileContentsManager, GenericFileCheckpoints, to_os_path,
+)
 from ..utils.sync import walk, walk_dirs
+
+
+setup_module = remigrate_test_schema
 
 
 class _APITestBase(APITest):
     """
     APITest that also runs a test for our implementation of `walk`.
     """
-
     def test_walk(self):
         """
         Test ContentsManager.walk.
@@ -175,26 +164,35 @@ class _APITestBase(APITest):
         )
 
 
-class PostgresContentsAPITest(_APITestBase):
-
+def postgres_contents_config():
+    """
+    Shared setup code for PostgresContentsAPITest and subclasses.
+    """
     config = Config()
     config.NotebookApp.contents_manager_class = PostgresContentsManager
     config.PostgresContentsManager.user_id = 'test'
     config.PostgresContentsManager.db_url = TEST_DB_URL
+    return config
+
+
+class PostgresContentsAPITest(_APITestBase):
+
+    config = postgres_contents_config()
 
     # Don't support hidden directories.
     hidden_dirs = []
 
-    @classmethod
-    def setup_class(cls):
-        drop_testing_db_tables()
-        migrate_testing_db()
-        super(PostgresContentsAPITest, cls).setup_class()
+    def setUp(self):
+        # This has to happen before the super call because the base class setup
+        # calls our make_* functions, which require a user or else we violate
+        # foreign-key constraints.
+        self.pg_manager.ensure_user()
+        self.pg_manager.ensure_root_directory()
+        super(PostgresContentsAPITest, self).setUp()
 
-    @classmethod
-    def teardown_class(cls):
-        drop_testing_db_tables()
-        super(PostgresContentsAPITest, cls).teardown_class()
+    def tearDown(self):
+        super(PostgresContentsAPITest, self).tearDown()
+        clear_test_db()
 
     @property
     def pg_manager(self):
@@ -208,6 +206,10 @@ class PostgresContentsAPITest(_APITestBase):
     def engine(self):
         return self.pg_manager.engine
 
+    @property
+    def crypto(self):
+        return self.pg_manager.crypto
+
     # Superclass method overrides.
     def make_dir(self, api_path):
         with self.engine.begin() as db:
@@ -220,16 +222,31 @@ class PostgresContentsAPITest(_APITestBase):
                 self.user_id,
                 api_path,
                 b64encode(txt.encode('utf-8')),
+                self.crypto.encrypt,
                 UNLIMITED,
             )
 
     def make_blob(self, api_path, blob):
         with self.engine.begin() as db:
-            save_file(db, self.user_id, api_path, b64encode(blob), UNLIMITED)
+            save_file(
+                db,
+                self.user_id,
+                api_path,
+                b64encode(blob),
+                self.crypto.encrypt,
+                UNLIMITED,
+            )
 
     def make_nb(self, api_path, nb):
         with self.engine.begin() as db:
-            save_file(db, self.user_id, api_path, writes_base64(nb), UNLIMITED)
+            save_file(
+                db,
+                self.user_id,
+                api_path,
+                writes_base64(nb),
+                self.crypto.encrypt,
+                UNLIMITED,
+            )
 
     def delete_dir(self, api_path, db=None):
         if self.isdir(api_path):
@@ -269,9 +286,27 @@ class PostgresContentsAPITest(_APITestBase):
     def test_checkpoints_separate_root(self):
         pass
 
+    def test_crypto_types(self):
+        self.assertIsInstance(self.pg_manager.crypto, NoEncryption)
+        self.assertIsInstance(self.pg_manager.checkpoints.crypto, NoEncryption)
+
+
+class EncryptedPostgresContentsAPITest(PostgresContentsAPITest):
+    config = postgres_contents_config()
+    config.PostgresContentsManager.crypto = make_fernet()
+
+    def test_crypto_types(self):
+        self.assertIsInstance(self.pg_manager.crypto, FernetEncryption)
+        self.assertIsInstance(
+            self.pg_manager.checkpoints.crypto,
+            FernetEncryption,
+        )
+
 
 class PostgresContentsFileCheckpointsAPITest(PostgresContentsAPITest):
-
+    """
+    Test using PostgresContents and FileCheckpoints.
+    """
     config = Config()
     config.NotebookApp.contents_manager_class = PostgresContentsManager
     config.PostgresContentsManager.checkpoints_class = GenericFileCheckpoints
@@ -283,8 +318,6 @@ class PostgresContentsFileCheckpointsAPITest(PostgresContentsAPITest):
 
     @classmethod
     def setup_class(cls):
-        drop_testing_db_tables()
-        migrate_testing_db()
         cls.td = TemporaryDirectory()
         cls.config.GenericFileCheckpoints.root_dir = cls.td.name
         super(PostgresContentsFileCheckpointsAPITest, cls).setup_class()
@@ -293,49 +326,53 @@ class PostgresContentsFileCheckpointsAPITest(PostgresContentsAPITest):
     def teardown_class(cls):
         super(PostgresContentsFileCheckpointsAPITest, cls).teardown_class()
         cls.td.cleanup()
-        drop_testing_db_tables()
 
 
-class PostgresCheckpointsAPITest(_APITestBase):
+def postgres_checkpoints_config():
     """
-    Test using PostgresCheckpoints with the built-in FileContentsManager.
+    Shared setup for PostgresCheckpointsAPITest and subclasses.
     """
-
     config = Config()
     config.NotebookApp.contents_manager_class = FileContentsManager
     config.ContentsManager.checkpoints_class = PostgresCheckpoints
     config.PostgresCheckpoints.user_id = 'test'
     config.PostgresCheckpoints.db_url = TEST_DB_URL
 
+    return config
+
+
+class PostgresCheckpointsAPITest(_APITestBase):
+    """
+    Test using PostgresCheckpoints with the built-in FileContentsManager.
+    """
+    config = postgres_checkpoints_config()
+
     @property
     def checkpoints(self):
         return self.notebook.contents_manager.checkpoints
 
-    @classmethod
-    def setup_class(cls):
-        drop_testing_db_tables()
-        migrate_testing_db()
-        super(PostgresCheckpointsAPITest, cls).setup_class()
-
-    @classmethod
-    def teardown_class(cls):
-        super(PostgresCheckpointsAPITest, cls).teardown_class()
-        drop_testing_db_tables()
-
     def setUp(self):
         super(PostgresCheckpointsAPITest, self).setUp()
-        self.checkpoints.purge_db()
         self.checkpoints.ensure_user()
 
     def tearDown(self):
-        super(PostgresCheckpointsAPITest, self).tearDown()
         self.checkpoints.purge_db()
+        clear_test_db()
+        super(PostgresCheckpointsAPITest, self).tearDown()
 
     def test_pgcheckpoints_is_used(self):
         self.assertIsInstance(self.checkpoints, PostgresCheckpoints)
 
     def test_checkpoints_separate_root(self):
         pass
+
+
+class EncryptedPostgresCheckpointsAPITest(PostgresCheckpointsAPITest):
+    config = postgres_checkpoints_config()
+    config.PostgresCheckpoints.crypto = make_fernet()
+
+    def test_crypto_types(self):
+        self.assertIsInstance(self.checkpoints.crypto, FernetEncryption)
 
 
 class HybridContentsPGRootAPITest(PostgresContentsAPITest):
@@ -346,28 +383,24 @@ class HybridContentsPGRootAPITest(PostgresContentsAPITest):
     files_test_cls = APITest
 
     @classmethod
-    def setup_class(cls):
-
-        drop_testing_db_tables()
-        migrate_testing_db()
-        cls.td = TemporaryDirectory()
-
-        cls.config = Config()
-        cls.config.NotebookApp.contents_manager_class = HybridContentsManager
-        cls.config.HybridContentsManager.manager_classes = {
+    def make_config(cls, td):
+        config = Config()
+        config.NotebookApp.contents_manager_class = HybridContentsManager
+        config.HybridContentsManager.manager_classes = {
             '': PostgresContentsManager,
             cls.files_prefix: FileContentsManager,
         }
-        cls.config.HybridContentsManager.manager_kwargs = {
+        config.HybridContentsManager.manager_kwargs = {
             '': {'user_id': 'test', 'db_url': TEST_DB_URL},
-            cls.files_prefix: {'root_dir': cls.td.name},
+            cls.files_prefix: {'root_dir': td.name},
         }
-        super(HybridContentsPGRootAPITest, cls).setup_class()
+        return config
 
     @classmethod
-    def teardown_class(cls):
-        super(HybridContentsPGRootAPITest, cls).teardown_class()
-        drop_testing_db_tables()
+    def setup_class(cls):
+        cls.td = TemporaryDirectory()
+        cls.config = cls.make_config(cls.td)
+        super(HybridContentsPGRootAPITest, cls).setup_class()
 
     @property
     def pg_manager(self):
@@ -413,6 +446,7 @@ class HybridContentsPGRootAPITest(PostgresContentsAPITest):
         l[method_name] = __api_path_dispatch(method_name)
     del __methods_to_multiplex
     del __api_path_dispatch
+    del l
 
     # Override to not delete the root of the file subsystem.
     def test_delete_dirs(self):
@@ -432,6 +466,24 @@ class HybridContentsPGRootAPITest(PostgresContentsAPITest):
         listing = self.api.list('/').json()['content']
         self.assertEqual(len(listing), 1)
         self.assertEqual(listing[0]['path'], self.files_prefix)
+
+
+class EncryptedHybridContentsAPITest(HybridContentsPGRootAPITest):
+
+    @classmethod
+    def make_config(cls, td):
+        config = super(EncryptedHybridContentsAPITest, cls).make_config(td)
+        config.HybridContentsManager.manager_kwargs['']['crypto'] = (
+            make_fernet()
+        )
+        return config
+
+    def test_crypto_types(self):
+        self.assertIsInstance(self.pg_manager.crypto, FernetEncryption)
+        self.assertIsInstance(
+            self.pg_manager.checkpoints.crypto,
+            FernetEncryption,
+        )
 
 
 # This needs to be removed or else we'll run the main IPython tests as well.

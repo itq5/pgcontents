@@ -11,18 +11,9 @@ from functools import wraps
 import mimetypes
 import posixpath
 
-try:
-    from nbformat import (
-        reads,
-        writes,
-    )
-except ImportError:
-    from IPython.nbformat import (
-        reads,
-        writes,
-    )
 from tornado.web import HTTPError
-from .error import PathOutsideRoot
+from .error import CorruptedFile, PathOutsideRoot
+from .utils.ipycompat import reads, writes
 
 NBFORMAT_VERSION = 4
 
@@ -126,7 +117,10 @@ def reads_base64(nb, as_version=NBFORMAT_VERSION):
     """
     Read a notebook from base64.
     """
-    return reads(b64decode(nb).decode('utf-8'), as_version=as_version)
+    try:
+        return reads(b64decode(nb).decode('utf-8'), as_version=as_version)
+    except Exception as e:
+        raise CorruptedFile(e)
 
 
 def _decode_text_from_base64(path, bcontent):
@@ -170,7 +164,17 @@ def from_b64(path, bcontent, format):
         'text': _decode_text_from_base64,
         None: _decode_unknown_from_base64,
     }
-    content, real_format = decoders[format](path, bcontent)
+
+    try:
+        content, real_format = decoders[format](path, bcontent)
+    except HTTPError:
+        # Pass through HTTPErrors, since we intend for them to bubble all the
+        # way back to the API layer.
+        raise
+    except Exception as e:
+        # Anything else should be wrapped in a CorruptedFile, since it likely
+        # indicates misconfiguration of encryption.
+        raise CorruptedFile(e)
 
     default_mimes = {
         'text': 'text/plain',

@@ -16,21 +16,6 @@ from six import (
     itervalues,
 )
 from unittest import TestCase
-
-try:
-    from notebook.services.contents.filemanager import \
-        FileContentsManager
-    from notebook.services.contents.tests.test_manager import \
-        TestContentsManager  # noqa
-    from notebook.services.contents.tests.test_contents_api import \
-        APITest  # noqa
-except ImportError:
-    from IPython.html.services.contents.filemanager import \
-        FileContentsManager
-    from IPython.html.services.contents.tests.test_manager import \
-        TestContentsManager  # noqa
-    from IPython.html.services.contents.tests.test_contents_api import \
-        APITest  # noqa
 from IPython.utils.tempdir import TemporaryDirectory
 
 from pgcontents.hybridmanager import HybridContentsManager
@@ -39,10 +24,14 @@ from pgcontents.pgmanager import PostgresContentsManager
 from .test_pgmanager import PostgresContentsManagerTestCase
 from .utils import (
     assertRaisesHTTPError,
-    drop_testing_db_tables,
-    migrate_testing_db,
+    make_fernet,
+    remigrate_test_schema,
     TEST_DB_URL,
 )
+from ..utils.ipycompat import APITest, FileContentsManager, TestContentsManager
+
+
+setup_module = remigrate_test_schema
 
 
 def _make_dir(contents_manager, api_path):
@@ -79,13 +68,11 @@ class FileTestCase(TestContentsManager):
 class PostgresTestCase(PostgresContentsManagerTestCase):
 
     def setUp(self):
-
-        drop_testing_db_tables()
-        migrate_testing_db()
-
+        self.crypto = make_fernet()
         self._pgmanager = PostgresContentsManager(
             user_id='test',
             db_url=TEST_DB_URL,
+            crypto=self.crypto,
         )
         self._pgmanager.ensure_user()
         self._pgmanager.ensure_root_directory()
@@ -102,10 +89,6 @@ class PostgresTestCase(PostgresContentsManagerTestCase):
 
     def set_pgmgr_attribute(self, name, value):
         setattr(self._pgmanager, name, value)
-
-    def tearDown(self):
-        drop_testing_db_tables()
-        migrate_testing_db()
 
     def make_dir(self, api_path):
         self.contents_manager.new(

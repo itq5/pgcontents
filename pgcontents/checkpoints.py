@@ -3,25 +3,9 @@ An IPython FileContentsManager that uses Postgres for checkpoints.
 """
 from __future__ import unicode_literals
 
-try:
-    from notebook.services.contents.checkpoints import (
-        GenericCheckpointsMixin,
-    )
-    from notebook.services.contents.manager import (
-        Checkpoints,
-    )
-except ImportError:
-    from IPython.html.services.contents.checkpoints import (
-        GenericCheckpointsMixin,
-    )
-    from IPython.html.services.contents.manager import (
-        Checkpoints,
-    )
-
 from .api_utils import (
     _decode_unknown_from_base64,
     outside_root_to_404,
-    prefix_dirs,
     reads_base64,
     to_b64,
     writes_base64,
@@ -31,12 +15,12 @@ from .query import (
     delete_remote_checkpoints,
     delete_single_remote_checkpoint,
     get_remote_checkpoint,
-    latest_remote_checkpoints,
     list_remote_checkpoints,
     move_remote_checkpoints,
     purge_remote_checkpoints,
     save_remote_checkpoint,
 )
+from .utils.ipycompat import Checkpoints, GenericCheckpointsMixin
 
 
 class PostgresCheckpoints(PostgresManagerMixin,
@@ -54,7 +38,14 @@ class PostgresCheckpoints(PostgresManagerMixin,
         """
         b64_content = writes_base64(nb)
         with self.engine.begin() as db:
-            return save_remote_checkpoint(db, self.user_id, path, b64_content)
+            return save_remote_checkpoint(
+                db,
+                self.user_id,
+                path,
+                b64_content,
+                self.crypto.encrypt,
+                self.max_file_size_bytes,
+            )
 
     @outside_root_to_404
     def create_file_checkpoint(self, content, format, path):
@@ -67,7 +58,14 @@ class PostgresCheckpoints(PostgresManagerMixin,
         except ValueError as e:
             self.do_400(str(e))
         with self.engine.begin() as db:
-            return save_remote_checkpoint(db, self.user_id, path, b64_content)
+            return save_remote_checkpoint(
+                db,
+                self.user_id,
+                path,
+                b64_content,
+                self.crypto.encrypt,
+                self.max_file_size_bytes,
+            )
 
     @outside_root_to_404
     def delete_checkpoint(self, checkpoint_id, path):
@@ -77,7 +75,7 @@ class PostgresCheckpoints(PostgresManagerMixin,
                 db, self.user_id, path, checkpoint_id,
             )
 
-    def _get_checkpoint(self, checkpoint_id, path):
+    def get_checkpoint_content(self, checkpoint_id, path):
         """Get the content of a checkpoint."""
         with self.engine.begin() as db:
             return get_remote_checkpoint(
@@ -85,11 +83,12 @@ class PostgresCheckpoints(PostgresManagerMixin,
                 self.user_id,
                 path,
                 checkpoint_id,
+                self.crypto.decrypt,
             )['content']
 
     @outside_root_to_404
     def get_notebook_checkpoint(self, checkpoint_id, path):
-        b64_content = self._get_checkpoint(checkpoint_id, path)
+        b64_content = self.get_checkpoint_content(checkpoint_id, path)
         return {
             'type': 'notebook',
             'content': reads_base64(b64_content),
@@ -97,7 +96,7 @@ class PostgresCheckpoints(PostgresManagerMixin,
 
     @outside_root_to_404
     def get_file_checkpoint(self, checkpoint_id, path):
-        b64_content = self._get_checkpoint(checkpoint_id, path)
+        b64_content = self.get_checkpoint_content(checkpoint_id, path)
         content, format = _decode_unknown_from_base64(path, b64_content)
         return {
             'type': 'file',
@@ -134,30 +133,3 @@ class PostgresCheckpoints(PostgresManagerMixin,
         """
         with self.engine.begin() as db:
             purge_remote_checkpoints(db, self.user_id)
-
-    def dump(self, contents_mgr):
-        """
-        Synchronize the state of our database with the specified
-        ContentsManager.
-
-        Gets the most recent checkpoint for each file and passes it to the
-        supplied ContentsManager to be saved.
-        """
-        with self.engine.begin() as db:
-            records = latest_remote_checkpoints(db, self.user_id)
-            for record in records:
-                path = record['path']
-                if not path.endswith('.ipynb'):
-                    self.log.warn('Ignoring non-notebook file: {}', path)
-                    continue
-                for dirname in prefix_dirs(path):
-                    self.log.info("Ensuring directory [%s]" % dirname)
-                    contents_mgr.save(
-                        model={'type': 'directory'},
-                        path=dirname,
-                    )
-                self.log.info("Writing notebook [%s]" % path)
-                contents_mgr.save(
-                    self.get_notebook_checkpoint(record['id'], path),
-                    path,
-                )
